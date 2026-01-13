@@ -68,6 +68,62 @@ def load_csv_data(uploaded_file):
         st.error(f"Erro ao ler o CSV: {e}")
         return None, None
 
+def ajustar_amortizacao_pela_cota(df, threshold_percent=0.02):
+    """
+    Identifica amortizações implícitas na queda da cota e preenche a coluna Resgate.
+    
+    Args:
+        df: DataFrame com colunas ['Data', 'Cota', 'Patrimônio', 'Resgate']
+        threshold_percent: Variação negativa mínima para considerar amortização (ex: 0.01 para 1%)
+    """
+    # Garante ordenação cronológica para o cálculo da variação
+    df = df.sort_values('Data', ascending=True).reset_index(drop=True)
+    
+    # 1. Calcular Quantidade de Cotas Implícita (Patrimônio / Cota)
+    # Usamos fillna(0) para evitar divisões por zero se houver dados sujos
+    df['Qtd_Cotas_Calc'] = df['Patrimônio'] / df['Cota']
+    
+    # 2. Calcular variação da cota e do patrimônio em relação ao dia anterior
+    df['Cota_Shift'] = df['Cota'].shift(1) # Valor do dia anterior
+    df['Var_Cota_Pct'] = (df['Cota'] / df['Cota_Shift']) - 1
+    
+    # 3. Lógica de Identificação:
+    # Se a cota caiu mais que o threshold (ex: -1%) E não há registro manual de resgate grande
+    # assumimos que a diferença é distribuição de capital.
+    
+    # Máscara para identificar os dias de amortização
+    # Nota: Var_Cota_Pct é negativo na queda, por isso usamos < -threshold
+    is_amortizacao = (df['Var_Cota_Pct'] < -threshold_percent)
+    
+    # 4. Calcular o valor financeiro da amortização
+    # Valor = (Queda na Cota) * (Quantidade de Cotas do dia)
+    diff_cota = df['Cota_Shift'] - df['Cota']
+    amortizacao_calculada = diff_cota * df['Qtd_Cotas_Calc']
+    
+    # 5. Aplicar o ajuste na coluna Resgate
+    # Somamos ao valor existente (caso haja algum resgate parcial de cotistas no mesmo dia)
+    df.loc[is_amortizacao, 'Resgate'] += amortizacao_calculada[is_amortizacao]
+    
+    # (Opcional) Log para você ver o que foi alterado
+    alteracoes = df.loc[is_amortizacao, ['Data', 'Cota', 'Var_Cota_Pct', 'Resgate']]
+    if not alteracoes.empty:
+        print(f"Amortizações detectadas e ajustadas via Cota (Threshold {-threshold_percent:.1%}):")
+        print(alteracoes)
+        
+    return df
+
+# --- COMO USAR NO SEU CÓDIGO ---
+# Supondo que você já carregou o df do arquivo CSV:
+# df = pd.read_csv(...) 
+
+# Converta a data para datetime se ainda não estiver
+df['Data'] = pd.to_datetime(df['Data'])
+
+# Aplica a correção (Recomendo threshold de 1% ou 2% para FIPs)
+df = ajustar_amortizacao_pela_cota(df, threshold_percent=0.02)
+
+# Agora o df tem a coluna 'Resgate' preenchida corretamente para o cálculo do PME.
+
 def calculate_ks_pme(fund_df, bench_df, date_col_fund, date_col_bench, col_map):
     """Realiza o cálculo do KS-PME."""
     
@@ -197,4 +253,5 @@ if fund_file and bench_file:
                     
             except Exception as e:
                 st.error(f"Erro durante o cálculo: {e}")
+
                 st.write("Dica: Verifique se as colunas numéricas contêm apenas números (ex: 1000.50) ou formato brasileiro (1.000,50).")
