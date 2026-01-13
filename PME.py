@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 
 # Configuração da página
@@ -9,6 +10,8 @@ st.title("📊 Calculadora KS-PME (Kaplan-Schoar)")
 st.markdown("""
 Esta ferramenta calcula o **Public Market Equivalent** comparando os fluxos de um fundo de Private Equity 
 com um índice de mercado público (Benchmark).
+
+**Atualização:** Inclui ajuste automático para amortizações via redução de cota (FIPs).
 """)
 
 # --- FUNÇÕES AUXILIARES ---
@@ -25,19 +28,66 @@ def clean_numeric_series(series):
     # Converte para string para poder manipular
     s = series.astype(str)
     
-    # Remove R$, $, espaços e pontos de milhar (assumindo formato BR: 1.000,00)
-    # Se o formato for US (1,000.00), essa lógica precisaria ser ajustada, 
-    # mas assumirei BR dado o contexto.
+    # Remove R$, $, espaços e pontos de milhar (assumindo formato BR: 1.000,00 se houver vírgula)
     s = s.str.replace('R$', '', regex=False)
     s = s.str.replace('$', '', regex=False)
-    s = s.str.replace(' ', '', regex=False)
+    s = s.str.strip()
     
-    # Lógica para detectar se é formato BR (tem vírgula como decimal) ou US
+    # Lógica para detectar se é formato BR (tem vírgula como decimal)
     # Se tiver vírgula, assumimos que é decimal -> trocamos por ponto
     # E removemos os pontos existentes (milhares) antes
-    s = s.apply(lambda x: x.replace('.', '').replace(',', '.') if ',' in x else x)
+    def converter_numero(x):
+        if ',' in x:
+            # Formato BR: 1.000,00 -> 1000.00
+            x = x.replace('.', '').replace(',', '.')
+        return x
+
+    s = s.apply(converter_numero)
     
     return pd.to_numeric(s, errors='coerce').fillna(0)
+
+def ajustar_amortizacao_pela_cota(df, col_map, threshold_percent=0.02):
+    """
+    Identifica amortizações implícitas na queda da cota e preenche a coluna Resgate.
+    """
+    # Mapear colunas baseadas na seleção do usuário
+    col_cota = col_map['quota']
+    col_pl = col_map['nav']
+    col_resgate = col_map['dist']
+    
+    # 1. Calcular Quantidade de Cotas Implícita (Patrimônio / Cota)
+    # Usamos replace de inf caso divida por zero
+    qtd_cotas = df[col_pl] / df[col_cota]
+    qtd_cotas = qtd_cotas.replace([np.inf, -np.inf], 0).fillna(0)
+    
+    # 2. Calcular variação da cota em relação ao dia anterior
+    cota_shift = df[col_cota].shift(1) # Valor do dia anterior
+    
+    # Evitar divisão por zero na variação
+    var_cota_pct = (df[col_cota] / cota_shift) - 1
+    var_cota_pct = var_cota_pct.fillna(0)
+    
+    # 3. Identificar Amortização (Queda brusca na cota maior que o threshold)
+    is_amortizacao = (var_cota_pct < -threshold_percent)
+    
+    # 4. Calcular o valor financeiro da amortização
+    # Valor = (Queda na Cota) * (Quantidade de Cotas do dia)
+    diff_cota = cota_shift - df[col_cota]
+    amortizacao_calculada = diff_cota * qtd_cotas
+    
+    # Filtrar apenas onde é amortização positiva
+    amortizacao_calculada = amortizacao_calculada.where(is_amortizacao, 0)
+    
+    # 5. Aplicar o ajuste na coluna Resgate
+    # Se a coluna resgate tiver nulos ou zeros, somamos o valor calculado
+    df[col_resgate] = df[col_resgate].fillna(0) + amortizacao_calculada.fillna(0)
+    
+    # Feedback visual se houve ajuste
+    total_ajustado = amortizacao_calculada.sum()
+    if total_ajustado > 0:
+        st.success(f"⚠️ Ajuste Automático: Detectamos {is_amortizacao.sum()} amortizações via cota. Total adicionado aos resgates: R$ {total_ajustado:,.2f}")
+        
+    return df
 
 @st.cache_data
 def load_csv_data(uploaded_file):
@@ -68,72 +118,12 @@ def load_csv_data(uploaded_file):
         st.error(f"Erro ao ler o CSV: {e}")
         return None, None
 
-def ajustar_amortizacao_pela_cota(df, threshold_percent=0.02):
-    """
-    Identifica amortizações implícitas na queda da cota e preenche a coluna Resgate.
-    
-    Args:
-        df: DataFrame com colunas ['Data', 'Cota', 'Patrimônio', 'Resgate']
-        threshold_percent: Variação negativa mínima para considerar amortização (ex: 0.01 para 1%)
-    """
-    # Garante ordenação cronológica para o cálculo da variação
-    df = df.sort_values('Data', ascending=True).reset_index(drop=True)
-    
-    # 1. Calcular Quantidade de Cotas Implícita (Patrimônio / Cota)
-    # Usamos fillna(0) para evitar divisões por zero se houver dados sujos
-    df['Qtd_Cotas_Calc'] = df['Patrimônio'] / df['Cota']
-    
-    # 2. Calcular variação da cota e do patrimônio em relação ao dia anterior
-    df['Cota_Shift'] = df['Cota'].shift(1) # Valor do dia anterior
-    df['Var_Cota_Pct'] = (df['Cota'] / df['Cota_Shift']) - 1
-    
-    # 3. Lógica de Identificação:
-    # Se a cota caiu mais que o threshold (ex: -1%) E não há registro manual de resgate grande
-    # assumimos que a diferença é distribuição de capital.
-    
-    # Máscara para identificar os dias de amortização
-    # Nota: Var_Cota_Pct é negativo na queda, por isso usamos < -threshold
-    is_amortizacao = (df['Var_Cota_Pct'] < -threshold_percent)
-    
-    # 4. Calcular o valor financeiro da amortização
-    # Valor = (Queda na Cota) * (Quantidade de Cotas do dia)
-    diff_cota = df['Cota_Shift'] - df['Cota']
-    amortizacao_calculada = diff_cota * df['Qtd_Cotas_Calc']
-    
-    # 5. Aplicar o ajuste na coluna Resgate
-    # Somamos ao valor existente (caso haja algum resgate parcial de cotistas no mesmo dia)
-    df.loc[is_amortizacao, 'Resgate'] += amortizacao_calculada[is_amortizacao]
-    
-    # (Opcional) Log para você ver o que foi alterado
-    alteracoes = df.loc[is_amortizacao, ['Data', 'Cota', 'Var_Cota_Pct', 'Resgate']]
-    if not alteracoes.empty:
-        print(f"Amortizações detectadas e ajustadas via Cota (Threshold {-threshold_percent:.1%}):")
-        print(alteracoes)
-        
-    return df
-
-# --- COMO USAR NO SEU CÓDIGO ---
-# Supondo que você já carregou o df do arquivo CSV:
-# df = pd.read_csv(...) 
-
-# Converta a data para datetime se ainda não estiver
-df['Data'] = pd.to_datetime(df['Data'])
-
-# Aplica a correção (Recomendo threshold de 1% ou 2% para FIPs)
-df = ajustar_amortizacao_pela_cota(df, threshold_percent=0.02)
-
-# Agora o df tem a coluna 'Resgate' preenchida corretamente para o cálculo do PME.
-
 def calculate_ks_pme(fund_df, bench_df, date_col_fund, date_col_bench, col_map):
     """Realiza o cálculo do KS-PME."""
     
-    # --- LIMPEZA CRÍTICA DOS DADOS ---
-    # Antes de qualquer conta, forçamos as colunas relevantes a serem números
-    cols_to_clean = [col_map['quota'], col_map['nav'], col_map['call'], col_map['dist']]
-    for col in cols_to_clean:
-        fund_df[col] = clean_numeric_series(fund_df[col])
-        
-    # Limpar coluna de preço do benchmark também
+    # Nota: A limpeza numérica já foi feita antes desta função ser chamada
+    
+    # Limpar coluna de preço do benchmark
     bench_price_col_orig = [c for c in bench_df.columns if c != date_col_bench][0]
     bench_df[bench_price_col_orig] = clean_numeric_series(bench_df[bench_price_col_orig])
 
@@ -224,6 +214,16 @@ if fund_file and bench_file:
         
         if st.button("Calcular KS-PME", type="primary"):
             try:
+                # 1. Limpeza forçada dos dados antes de qualquer lógica
+                cols_to_clean = [col_quota, col_nav, col_call, col_dist]
+                for col in cols_to_clean:
+                    df_fund[col] = clean_numeric_series(df_fund[col])
+
+                # 2. Aplicar Ajuste de Amortização (Correção do -98%)
+                # Threshold de 2% (0.02) captura quedas relevantes que são amortizações
+                df_fund = ajustar_amortizacao_pela_cota(df_fund, col_map, threshold_percent=0.02)
+
+                # 3. Calcular KS-PME
                 ks_pme, fund_ret, bench_ret, df_processed = calculate_ks_pme(
                     df_fund, df_bench, date_col_fund, date_col_bench, col_map
                 )
@@ -240,18 +240,18 @@ if fund_file and bench_file:
                 
                 # Gráfico
                 st.subheader("Curva de Performance (Base 100)")
+                # Normalização base 100
                 df_processed['Fundo_Norm'] = (df_processed[col_map['quota']] / df_processed[col_map['quota']].iloc[0]) * 100
                 df_processed['Bench_Norm'] = (df_processed['bench_price'] / df_processed['bench_price'].iloc[0]) * 100
                 
                 fig = go.Figure()
-                fig.add_trace(go.Scatter(x=df_processed[date_col_fund], y=df_processed['Fundo_Norm'], name='Fundo'))
+                fig.add_trace(go.Scatter(x=df_processed[date_col_fund], y=df_processed['Fundo_Norm'], name='Fundo (Cota)'))
                 fig.add_trace(go.Scatter(x=df_processed[date_col_fund], y=df_processed['Bench_Norm'], name='Benchmark'))
                 st.plotly_chart(fig, use_container_width=True)
                 
-                with st.expander("Ver dados processados"):
+                with st.expander("Ver dados processados (inclui amortizações ajustadas)"):
                     st.dataframe(df_processed)
                     
             except Exception as e:
                 st.error(f"Erro durante o cálculo: {e}")
-
-                st.write("Dica: Verifique se as colunas numéricas contêm apenas números (ex: 1000.50) ou formato brasileiro (1.000,50).")
+                st.write("Dica: Verifique se as colunas numéricas contêm apenas números.")
