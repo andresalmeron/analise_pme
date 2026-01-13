@@ -136,7 +136,6 @@ def calculate_ks_pme(fund_df, bench_df, date_col_fund, date_col_bench, col_map):
     merged['PME_NAV'] = merged['cum_shares_bench'] * merged['bench_price']
     
     # TVPI Bench = (Distribuições Mesmas do Fundo + PME NAV) / Capital Investido
-    # Esta métrica responde: "Qual seria meu múltiplo se eu tivesse investido no índice?"
     merged['TVPI_Bench'] = (merged['cum_dist'] + merged['PME_NAV']) / merged['invested_capital']
     
     # Normalização Base 100 para o gráfico
@@ -144,9 +143,9 @@ def calculate_ks_pme(fund_df, bench_df, date_col_fund, date_col_bench, col_map):
     merged['TVPI_Bench_100'] = merged['TVPI_Bench'] * 100
     merged['Quota_100'] = (merged[col_map['quota']] / merged[col_map['quota']].iloc[0]) * 100
     
-    # Retornos Finais (Percentuais baseados no TVPI Final)
+    # Retornos Finais
     fund_ret_final = merged['TVPI_Fund'].iloc[-1] - 1
-    bench_ret_pme = merged['TVPI_Bench'].iloc[-1] - 1 # Aqui está a mágica: Retorno PME, não B&H
+    bench_ret_pme = merged['TVPI_Bench'].iloc[-1] - 1
 
     return ks_pme, fund_ret_final, bench_ret_pme, merged
 
@@ -199,8 +198,16 @@ if fund_file and bench_file:
                 k1, k2, k3 = st.columns(3)
                 k1.metric("KS-PME Score", f"{ks:.2f}x", delta="Alpha Gerado" if ks > 1 else "Alpha Negativo")
                 k2.metric("Retorno Fundo (TVPI)", f"{ret_f:.2%}", help="Retorno total real do fundo")
-                k3.metric("Retorno Benchmark (PME)", f"{ret_b_pme:.2%}", help="Retorno da carteira equivalente no índice (Mesmos fluxos)")
+                k3.metric("Retorno Benchmark (PME)", f"{ret_b_pme:.2%}", help="Retorno da carteira equivalente no índice")
                 
+                # --- VEREDITO PEDAGÓGICO ---
+                if ks > 1.0:
+                    st.success(f"🚀 **O Fundo superou o Benchmark!**\n\nO índice de **{ks:.2f}x** significa que o fundo entregou **{(ks-1)*100:.1f}% mais riqueza** do que se o mesmo capital tivesse sido investido no índice público (PME).")
+                elif ks < 1.0:
+                    st.error(f"📉 **O Fundo perdeu para o Benchmark.**\n\nO índice de **{ks:.2f}x** significa que o fundo entregou apenas **{ks*100:.1f}%** da riqueza que o investidor teria acumulado no índice público.")
+                else:
+                    st.warning(f"⚖️ **Empate Técnico.**\n\nO fundo entregou exatamente o mesmo retorno do índice de referência.")
+
                 # Gráfico
                 st.subheader("Performance Relativa (TVPI Base 100)")
                 
