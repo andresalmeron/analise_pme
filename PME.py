@@ -10,10 +10,9 @@ st.title("📊 Calculadora KS-PME (Kaplan-Schoar)")
 st.markdown("""
 Esta ferramenta compara a performance de um fundo de Private Equity com um Benchmark de mercado público.
 
-**Gráfico Master:**
-- 🔵 **Cota:** Preço unitário (sofre queda com amortizações).
-- 🟢 **TVPI Fundo:** Retorno Total Real do Fundo (Dinheiro no Bolso + Valor Residual).
-- 🟠 **TVPI Benchmark (PME):** Retorno Total se o mesmo dinheiro tivesse sido investido no Índice.
+**Conceito (Apples to Apples):**
+Comparamos o retorno do seu fundo com uma **carteira teórica** que compra o índice (Benchmark)
+exatamente nas mesmas datas e proporções das chamadas de capital do fundo.
 """)
 
 # --- FUNÇÕES AUXILIARES ---
@@ -95,7 +94,7 @@ def calculate_ks_pme(fund_df, bench_df, date_col_fund, date_col_bench, col_map):
         direction='backward'
     ).rename(columns={bench_price_col: 'bench_price'}).dropna(subset=['bench_price'])
 
-    # 2. PME Tradicional (Kaplan-Schoar)
+    # 2. PME Tradicional (Kaplan-Schoar) - Math
     idx_T = merged['bench_price'].iloc[-1]
     merged['idx_multiplier'] = idx_T / merged['bench_price']
     
@@ -108,13 +107,13 @@ def calculate_ks_pme(fund_df, bench_df, date_col_fund, date_col_bench, col_map):
     
     ks_pme = numerator / denominator if denominator != 0 else 0
     
-    # 3. Séries Temporais para Gráfico
+    # 3. Séries Temporais para Gráfico e Métricas PME
     
     # --- A. Fundo Real ---
     merged['cum_dist'] = merged[col_map['dist']].cumsum()
     merged['cum_call'] = merged[col_map['call']].cumsum()
     
-    # Base de Custo Dinâmica (Se não houver call, assume NAV inicial como custo)
+    # Base de Custo Dinâmica
     start_nav = merged[col_map['nav']].iloc[0]
     merged['invested_capital'] = merged['cum_call'].replace(0, np.nan).fillna(start_nav)
     
@@ -127,7 +126,7 @@ def calculate_ks_pme(fund_df, bench_df, date_col_fund, date_col_bench, col_map):
     # Fluxo de Cotas do Índice: (Compra com Call - Vende com Dist) / Preço do Índice
     merged['flow_shares'] = (merged[col_map['call']] - merged[col_map['dist']]) / merged['bench_price']
     
-    # Se não houve Calls registrados, assume que o NAV inicial comprou índice no dia 0
+    # Se não houve Calls, assume que o NAV inicial estava comprado no índice
     total_call = merged[col_map['call']].sum()
     initial_shares = (start_nav / merged['bench_price'].iloc[0]) if total_call == 0 else 0
     
@@ -137,7 +136,7 @@ def calculate_ks_pme(fund_df, bench_df, date_col_fund, date_col_bench, col_map):
     merged['PME_NAV'] = merged['cum_shares_bench'] * merged['bench_price']
     
     # TVPI Bench = (Distribuições Mesmas do Fundo + PME NAV) / Capital Investido
-    # Nota: Usamos as mesmas distribuições no numerador para comparar maçãs com maçãs (Cash out + Value Left)
+    # Esta métrica responde: "Qual seria meu múltiplo se eu tivesse investido no índice?"
     merged['TVPI_Bench'] = (merged['cum_dist'] + merged['PME_NAV']) / merged['invested_capital']
     
     # Normalização Base 100 para o gráfico
@@ -145,12 +144,11 @@ def calculate_ks_pme(fund_df, bench_df, date_col_fund, date_col_bench, col_map):
     merged['TVPI_Bench_100'] = merged['TVPI_Bench'] * 100
     merged['Quota_100'] = (merged[col_map['quota']] / merged[col_map['quota']].iloc[0]) * 100
     
-    # Retornos Simples (Texto)
-    invested_final = merged['invested_capital'].iloc[-1]
-    fund_ret_final = ((merged['cum_dist'].iloc[-1] + nav_final) / invested_final) - 1
-    bench_ret_simple = (merged['bench_price'].iloc[-1] / merged['bench_price'].iloc[0]) - 1
+    # Retornos Finais (Percentuais baseados no TVPI Final)
+    fund_ret_final = merged['TVPI_Fund'].iloc[-1] - 1
+    bench_ret_pme = merged['TVPI_Bench'].iloc[-1] - 1 # Aqui está a mágica: Retorno PME, não B&H
 
-    return ks_pme, fund_ret_final, bench_ret_simple, merged
+    return ks_pme, fund_ret_final, bench_ret_pme, merged
 
 # --- INTERFACE ---
 
@@ -193,18 +191,18 @@ if fund_file and bench_file:
                 df_fund = ajustar_amortizacao_pela_cota(df_fund, col_map, 0.02)
                 
                 # 3. Cálculo
-                ks, ret_f, ret_b, df_res = calculate_ks_pme(df_fund, df_bench, date_col_fund, date_col_bench, col_map)
+                ks, ret_f, ret_b_pme, df_res = calculate_ks_pme(df_fund, df_bench, date_col_fund, date_col_bench, col_map)
                 
                 st.divider()
                 
                 # KPIs
                 k1, k2, k3 = st.columns(3)
-                k1.metric("KS-PME Score", f"{ks:.2f}x", delta="Alpha Gerado" if ks > 1 else "Destruição de Valor")
-                k2.metric("TVPI Fundo", f"{ret_f:.2%}", help="Retorno Total sobre Capital Investido")
-                k3.metric("Benchmark (Simples)", f"{ret_b:.2%}", help="Retorno Buy & Hold do Índice")
+                k1.metric("KS-PME Score", f"{ks:.2f}x", delta="Alpha Gerado" if ks > 1 else "Alpha Negativo")
+                k2.metric("Retorno Fundo (TVPI)", f"{ret_f:.2%}", help="Retorno total real do fundo")
+                k3.metric("Retorno Benchmark (PME)", f"{ret_b_pme:.2%}", help="Retorno da carteira equivalente no índice (Mesmos fluxos)")
                 
                 # Gráfico
-                st.subheader("Batalha de Retornos: Fundo vs. Benchmark PME")
+                st.subheader("Performance Relativa (TVPI Base 100)")
                 
                 fig = go.Figure()
                 
@@ -234,14 +232,7 @@ if fund_file and bench_file:
                 )
                 st.plotly_chart(fig, use_container_width=True)
                 
-                st.success(f"""
-                **Análise Rápida:**
-                - Se a linha **Verde** estiver acima da **Laranja**, o fundo bateu o mercado (Alpha).
-                - A diferença vertical entre elas é o valor agregado pelo gestor.
-                - KS-PME Final: **{ks:.2f}x**
-                """)
-                
-                with st.expander("Dados Detalhados"):
+                with st.expander("Ver dados processados"):
                     st.dataframe(df_res)
                     
             except Exception as e:
