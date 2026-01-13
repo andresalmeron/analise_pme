@@ -8,11 +8,8 @@ st.set_page_config(page_title="Calculadora KS-PME", layout="wide")
 
 st.title("📊 Calculadora KS-PME (Kaplan-Schoar)")
 st.markdown("""
-Esta ferramenta compara a performance de um fundo de Private Equity com um Benchmark de mercado público.
-
-**Conceito (Apples to Apples):**
-Comparamos o retorno do seu fundo com uma **carteira teórica** que compra o índice (Benchmark)
-exatamente nas mesmas datas e proporções das chamadas de capital do fundo.
+Esta ferramenta compara a performance de um fundo de Private Equity com um Benchmark de mercado público
+utilizando a metodologia PME (Public Market Equivalent).
 """)
 
 # --- FUNÇÕES AUXILIARES ---
@@ -109,7 +106,6 @@ def calculate_ks_pme(fund_df, bench_df, date_col_fund, date_col_bench, col_map):
     
     # 3. Séries Temporais para Gráfico e Métricas PME
     
-    # --- A. Fundo Real ---
     merged['cum_dist'] = merged[col_map['dist']].cumsum()
     merged['cum_call'] = merged[col_map['call']].cumsum()
     
@@ -117,37 +113,62 @@ def calculate_ks_pme(fund_df, bench_df, date_col_fund, date_col_bench, col_map):
     start_nav = merged[col_map['nav']].iloc[0]
     merged['invested_capital'] = merged['cum_call'].replace(0, np.nan).fillna(start_nav)
     
-    # TVPI Fundo = (Distribuições + NAV Atual) / Capital Investido
+    # A. Fundo Real
     merged['TVPI_Fund'] = (merged['cum_dist'] + merged[col_map['nav']]) / merged['invested_capital']
     
-    # --- B. Benchmark Equivalente (PME Simulation) ---
-    # Simulamos comprar o índice com os Calls e vender com os Dists
-    
-    # Fluxo de Cotas do Índice: (Compra com Call - Vende com Dist) / Preço do Índice
+    # B. Benchmark Equivalente (PME Simulation)
     merged['flow_shares'] = (merged[col_map['call']] - merged[col_map['dist']]) / merged['bench_price']
     
-    # Se não houve Calls, assume que o NAV inicial estava comprado no índice
     total_call = merged[col_map['call']].sum()
     initial_shares = (start_nav / merged['bench_price'].iloc[0]) if total_call == 0 else 0
     
     merged['cum_shares_bench'] = merged['flow_shares'].cumsum() + initial_shares
-    
-    # PME NAV = Quantidade de Cotas Teóricas * Preço Atual
     merged['PME_NAV'] = merged['cum_shares_bench'] * merged['bench_price']
     
-    # TVPI Bench = (Distribuições Mesmas do Fundo + PME NAV) / Capital Investido
     merged['TVPI_Bench'] = (merged['cum_dist'] + merged['PME_NAV']) / merged['invested_capital']
     
-    # Normalização Base 100 para o gráfico
+    # --- NOVAS COLUNAS PEDAGÓGICAS ---
+    
+    # 1. Simulação 100k
+    # Se investiu 100k proporcionalmente às chamadas, quanto tem hoje (Caixa recebido + Valor em carteira)
+    merged['Sim_100k_Fund'] = merged['TVPI_Fund'] * 100000
+    merged['Sim_100k_Bench'] = merged['TVPI_Bench'] * 100000
+    
+    # 2. Retorno Acumulado %
+    merged['Retorno_Acum_Fund_Pct'] = (merged['TVPI_Fund'] - 1) * 100
+    merged['Retorno_Acum_Bench_Pct'] = (merged['TVPI_Bench'] - 1) * 100
+    
+    # 3. Retorno Anualizado (CAGR)
+    # Dias passados desde o início do fundo
+    start_date = merged[date_col_fund].iloc[0]
+    merged['Years_Elapsed'] = (merged[date_col_fund] - start_date).dt.days / 365.25
+    
+    # Evitar divisão por zero ou periodos muito curtos no início
+    def calc_cagr(tvpi, years):
+        if years < 0.1: return 0
+        return (tvpi ** (1/years)) - 1
+        
+    merged['Retorno_Anual_Fund_Pct'] = merged.apply(lambda x: calc_cagr(x['TVPI_Fund'], x['Years_Elapsed']), axis=1) * 100
+    merged['Retorno_Anual_Bench_Pct'] = merged.apply(lambda x: calc_cagr(x['TVPI_Bench'], x['Years_Elapsed']), axis=1) * 100
+
+    # Normalização Base 100 para o gráfico visual
     merged['TVPI_Fund_100'] = merged['TVPI_Fund'] * 100
     merged['TVPI_Bench_100'] = merged['TVPI_Bench'] * 100
     merged['Quota_100'] = (merged[col_map['quota']] / merged[col_map['quota']].iloc[0]) * 100
     
-    # Retornos Finais
-    fund_ret_final = merged['TVPI_Fund'].iloc[-1] - 1
-    bench_ret_pme = merged['TVPI_Bench'].iloc[-1] - 1
+    # Retornos Finais (Escalares)
+    metrics = {
+        'fund_tvpi': merged['TVPI_Fund'].iloc[-1],
+        'bench_tvpi': merged['TVPI_Bench'].iloc[-1],
+        'fund_100k': merged['Sim_100k_Fund'].iloc[-1],
+        'bench_100k': merged['Sim_100k_Bench'].iloc[-1],
+        'fund_cagr': merged['Retorno_Anual_Fund_Pct'].iloc[-1],
+        'bench_cagr': merged['Retorno_Anual_Bench_Pct'].iloc[-1],
+        'fund_accum': merged['Retorno_Acum_Fund_Pct'].iloc[-1],
+        'bench_accum': merged['Retorno_Acum_Bench_Pct'].iloc[-1]
+    }
 
-    return ks_pme, fund_ret_final, bench_ret_pme, merged
+    return ks_pme, metrics, merged
 
 # --- INTERFACE ---
 
@@ -190,26 +211,58 @@ if fund_file and bench_file:
                 df_fund = ajustar_amortizacao_pela_cota(df_fund, col_map, 0.02)
                 
                 # 3. Cálculo
-                ks, ret_f, ret_b_pme, df_res = calculate_ks_pme(df_fund, df_bench, date_col_fund, date_col_bench, col_map)
+                ks, m, df_res = calculate_ks_pme(df_fund, df_bench, date_col_fund, date_col_bench, col_map)
                 
                 st.divider()
                 
-                # KPIs
-                k1, k2, k3 = st.columns(3)
-                k1.metric("KS-PME Score", f"{ks:.2f}x", delta="Alpha Gerado" if ks > 1 else "Alpha Negativo")
-                k2.metric("Retorno Fundo (TVPI)", f"{ret_f:.2%}", help="Retorno total real do fundo")
-                k3.metric("Retorno Benchmark (PME)", f"{ret_b_pme:.2%}", help="Retorno da carteira equivalente no índice")
-                
                 # --- VEREDITO PEDAGÓGICO ---
+                # Comparação direta de dinheiro
+                delta_val = m['fund_tvpi'] - m['bench_tvpi']
+                
                 if ks > 1.0:
-                    st.success(f"🚀 **O Fundo superou o Benchmark!**\n\nO índice de **{ks:.2f}x** significa que o fundo entregou **{(ks-1)*100:.1f}% mais riqueza** do que se o mesmo capital tivesse sido investido no índice público (PME).")
+                    st.success(f"""
+                    ### 🚀 O Fundo superou o Benchmark! (KS-PME: {ks:.2f}x)
+                    
+                    Para cada **R$ 1,00 investido**, veja o resultado final (Dinheiro no Bolso + Valor Residual):
+                    * **No Fundo PE:** Você obteve **R$ {m['fund_tvpi']:.2f}**
+                    * **No Benchmark PME:** Você teria obtido **R$ {m['bench_tvpi']:.2f}**
+                    
+                    Isso representa um ganho real de **R$ {delta_val:.2f}** por real investido acima do mercado.
+                    """)
                 elif ks < 1.0:
-                    st.error(f"📉 **O Fundo perdeu para o Benchmark.**\n\nO índice de **{ks:.2f}x** significa que o fundo entregou apenas **{ks*100:.1f}%** da riqueza que o investidor teria acumulado no índice público.")
+                    st.error(f"""
+                    ### 📉 O Fundo perdeu para o Benchmark. (KS-PME: {ks:.2f}x)
+                    
+                    Para cada **R$ 1,00 investido**, veja o resultado final (Dinheiro no Bolso + Valor Residual):
+                    * **No Fundo PE:** Você obteve **R$ {m['fund_tvpi']:.2f}**
+                    * **No Benchmark PME:** Você teria obtido **R$ {m['bench_tvpi']:.2f}**
+                    
+                    Você deixou de ganhar **R$ {abs(delta_val):.2f}** por real investido ao escolher este fundo.
+                    """)
                 else:
-                    st.warning(f"⚖️ **Empate Técnico.**\n\nO fundo entregou exatamente o mesmo retorno do índice de referência.")
+                    st.warning("⚖️ **Empate Técnico.** O fundo entregou exatamente o mesmo retorno financeiro do índice.")
 
+                # --- TABELA COMPARATIVA ---
+                st.subheader("Raio-X da Performance")
+                res_table = pd.DataFrame({
+                    'Métrica': ['Retorno Total (Múltiplo)', 'Retorno Acumulado (%)', 'Retorno Anualizado (CAGR)', 'Simulação R$ 100k'],
+                    'Fundo PE': [
+                        f"{m['fund_tvpi']:.2f}x",
+                        f"{m['fund_accum']:.1f}%",
+                        f"{m['fund_cagr']:.1f}% ao ano",
+                        f"R$ {m['fund_100k']:,.2f}"
+                    ],
+                    'Benchmark PME': [
+                        f"{m['bench_tvpi']:.2f}x",
+                        f"{m['bench_accum']:.1f}%",
+                        f"{m['bench_cagr']:.1f}% ao ano",
+                        f"R$ {m['bench_100k']:,.2f}"
+                    ]
+                })
+                st.table(res_table)
+                
                 # Gráfico
-                st.subheader("Performance Relativa (TVPI Base 100)")
+                st.subheader("Curva de Criação de Valor (Base 100)")
                 
                 fig = go.Figure()
                 
@@ -228,18 +281,18 @@ if fund_file and bench_file:
                 # Cota Nominal (Azul Tracejado)
                 fig.add_trace(go.Scatter(
                     x=df_res[date_col_fund], y=df_res['Quota_100'],
-                    name='Valor da Cota (Ref)', line=dict(color='blue', width=1, dash='dot')
+                    name='Valor Cota (Ref)', line=dict(color='blue', width=1, dash='dot')
                 ))
 
                 fig.update_layout(
-                    title="Criação de Valor: Fundo vs Benchmark (Fluxos Equivalentes)",
+                    title="Evolução da Riqueza: Fundo vs Benchmark",
                     yaxis_title="Base 100",
                     hovermode="x unified",
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
                 )
                 st.plotly_chart(fig, use_container_width=True)
                 
-                with st.expander("Ver dados processados"):
+                with st.expander("Ver dados detalhados (Download CSV)"):
                     st.dataframe(df_res)
                     
             except Exception as e:
